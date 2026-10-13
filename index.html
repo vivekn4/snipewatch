@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SnipeWatch — Price Drop Tracker</title>
+<meta name="description" content="SnipeWatch: track product prices, get alerted on drops. Free, private, runs entirely in your browser.">
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎯</text></svg>">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">🎯</span>
+    <div>
+      <h1>SnipeWatch</h1>
+      <p class="tagline">Never overpay again.</p>
+    </div>
+  </div>
+  <div class="topbar-actions">
+    <label class="interval-wrap" title="Auto-check prices while this tab is open">
+      <span>Auto-check</span>
+      <select id="intervalSelect" aria-label="Auto-check interval">
+        <option value="0">Off</option>
+        <option value="30">Every 30 min</option>
+        <option value="60" selected>Every hour</option>
+        <option value="360">Every 6 hours</option>
+        <option value="1440">Daily</option>
+      </select>
+    </label>
+    <button id="notifBtn" class="icon-btn" title="Enable browser notifications" aria-label="Toggle browser notifications">🔔</button>
+    <button id="muteBtn" class="icon-btn" title="Toggle sound effects" aria-label="Toggle sound effects">🔊</button>
+    <button id="checkAllBtn" class="primary-btn">Check all prices</button>
+  </div>
+</header>
+
+<main>
+  <div id="hintBar" class="hint-bar" hidden>
+    <p><strong>How it works:</strong> SnipeWatch reads the product page through a free proxy and looks for the
+    price in the page's structured data. Some sites (e.g. Amazon) block automated reads — for those, use
+    <strong>Log price</strong> on the card to enter it manually. Checks run while this tab is open.</p>
+    <button id="hintClose" aria-label="Dismiss hint">✕</button>
+  </div>
+
+  <section class="add-card" aria-labelledby="addHeading">
+    <h2 id="addHeading">Track a new product</h2>
+    <form id="addForm">
+      <div class="field">
+        <label for="pName">Product name</label>
+        <input id="pName" type="text" placeholder="Sony WH-1000XM5" maxlength="80" required>
+      </div>
+      <div class="field grow">
+        <label for="pUrl">Product URL</label>
+        <input id="pUrl" type="url" placeholder="https://www.example.com/product/123" required>
+      </div>
+      <div class="field">
+        <label for="pTarget">Target price ($)</label>
+        <input id="pTarget" type="number" min="0.01" step="0.01" placeholder="199.99" required>
+      </div>
+      <button type="submit" class="primary-btn">Track it</button>
+    </form>
+  </section>
+
+  <section aria-labelledby="watchHeading">
+    <h2 id="watchHeading" class="section-title">Watchlist <span id="watchCount" class="count-badge">0</span></h2>
+    <div id="emptyState" class="empty-state">
+      <div class="empty-art" aria-hidden="true">🏷️</div>
+      <p><strong>No targets yet.</strong><br>Add your first product above and SnipeWatch will keep an eye on the price for you.</p>
+    </div>
+    <div id="productGrid" class="product-grid"></div>
+  </section>
+</main>
+
+<div id="toastRegion" class="toast-region" aria-live="polite"></div>
+
+<footer>
+  <p>Made with 🎯 by <span class="vn-tag">VN</span> · SnipeWatch runs 100% in your browser — your watchlist never leaves this device.</p>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
