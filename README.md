@@ -16,7 +16,7 @@
 
 ## Screenshot
 
-![SnipeWatch UI mockup](assets/screenshot.png)
+![SnipeWatch UI mockup](assets/screenshot.svg)
 
 *Above: generated mockup of the SnipeWatch interface (programmatically rendered preview, not a live capture). The real app matches this layout: header with auto-check controls, add-product form, and watchlist cards with price-history charts.*
 
@@ -73,7 +73,7 @@ snipewatch/
 ├── index.html          # app shell
 ├── styles.css          # dark mission-control theme
 ├── app.js              # storage, price engine, charts, alerts, SFX
-├── assets/screenshot.png
+├── assets/screenshot.svg
 ├── test/
 │   ├── parse_test.js
 │   └── fixtures/       # sample product-page HTML
