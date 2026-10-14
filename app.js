@@ -36,63 +36,76 @@ function normalizePrice(raw) {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-/** Try to parse a JSON-LD block and pull a price out of it. Returns number|null. */
-function priceFromJsonLdObject(node, depth) {
-  if (node == null || depth > 4) return null;
-  if (Array.isArray(node)) {
-    for (const item of node) {
-      const p = priceFromJsonLdObject(item, depth + 1);
-      if (p != null) return p;
-    }
-    return null;
-  }
-  if (typeof node !== 'object') return null;
-  if (node['@graph']) {
-    const p = priceFromJsonLdObject(node['@graph'], depth + 1);
-    if (p != null) return p;
-  }
-  const type = node['@type'];
-  const isProduct = type === 'Product' ||
-    (Array.isArray(type) && type.includes('Product'));
-  const offers = node.offers;
-  if (offers) {
-    const list = Array.isArray(offers) ? offers : [offers];
-    // Prefer an actual sale price on a Product node
-    for (const offer of list) {
-      if (offer && offer.price != null) {
-        const p = normalizePrice(offer.price);
-        if (p != null) return p;
-      }
-    }
-    for (const offer of list) {
-      if (offer && offer.lowPrice != null) {
-        const p = normalizePrice(offer.lowPrice);
-        if (p != null) return p;
-      }
-    }
-    // AggregateOffer without lowPrice: try first priceSpec
-    for (const offer of list) {
-      if (offer && offer.priceSpecification && offer.priceSpecification.price != null) {
-        const p = normalizePrice(offer.priceSpecification.price);
-        if (p != null) return p;
-      }
-    }
-  }
-  // Recurse into nested values (but prefer direct hits above)
-  if (!isProduct) {
-    for (const key of Object.keys(node)) {
-      if (key === '@graph' || key === 'offers') continue;
-      const p = priceFromJsonLdObject(node[key], depth + 1);
-      if (p != null) return p;
-    }
-  }
+/** Strip the schema.org URL prefix off an availability value: 'https://schema.org/InStock' -> 'InStock'. */
+function cleanAvailability(v) {
+  if (typeof v !== 'string') return null;
+  const tail = v.split('/').pop().trim();
+  return tail || null;
+}
+
+/** First non-null value in a list, or null. */
+function firstNonNull(list) {
+  for (const v of list) if (v != null) return v;
   return null;
 }
 
 /**
+ * Walk a parsed JSON-LD document and collect one entry per Product node:
+ * { prices: [numbers], availability, currency }.
+ * A single Product with several seller offers contributes all its offer
+ * prices; a page with several distinct Product nodes contributes one entry
+ * each, so callers can tell "one product, many sellers" apart from
+ * "a category/search page with many products".
+ */
+function collectProductOffers(node, depth, out) {
+  if (node == null || depth > 5) return;
+  if (Array.isArray(node)) {
+    for (const item of node) collectProductOffers(item, depth + 1, out);
+    return;
+  }
+  if (typeof node !== 'object') return;
+  if (node['@graph']) collectProductOffers(node['@graph'], depth + 1, out);
+  const type = node['@type'];
+  const isProduct = type === 'Product' ||
+    (Array.isArray(type) && type.includes('Product'));
+  if (isProduct) {
+    const entry = { prices: [], availability: null, currency: null };
+    const offers = node.offers;
+    if (offers) {
+      const list = Array.isArray(offers) ? offers : [offers];
+      for (const offer of list) {
+        if (!offer || typeof offer !== 'object') continue;
+        let p = null;
+        if (offer.price != null) p = normalizePrice(offer.price);
+        if (p == null && offer.lowPrice != null) p = normalizePrice(offer.lowPrice);
+        if (p == null && offer.priceSpecification && offer.priceSpecification.price != null) {
+          p = normalizePrice(offer.priceSpecification.price);
+        }
+        if (p != null) entry.prices.push(p);
+        if (!entry.availability && offer.availability != null) {
+          entry.availability = cleanAvailability(offer.availability);
+        }
+        if (!entry.currency && offer.priceCurrency != null) {
+          entry.currency = String(offer.priceCurrency).toUpperCase();
+        }
+      }
+    }
+    out.push(entry);
+  }
+  // Recurse into everything except offers (already consumed) and @graph (visited above),
+  // so nested Product nodes (e.g. isRelatedTo) are still found.
+  for (const key of Object.keys(node)) {
+    if (key === 'offers' || key === '@graph') continue;
+    collectProductOffers(node[key], depth + 1, out);
+  }
+}
+
+/**
  * Extract a price from raw product-page HTML.
- * Returns { price, currency, source } or null.
- * source: 'json-ld' | 'meta' | 'markup' (markup = unverified fallback)
+ * Returns { price, currency, source, availability } or null.
+ * source: 'json-ld' | 'meta' | 'microdata' | 'markup' (markup = unverified fallback).
+ * Returns { ambiguous: true } when the page carries several DIFFERENT product
+ * prices (e.g. a category/search page): guessing one would be worse than none.
  */
 function extractPrice(html) {
   if (!html || typeof html !== 'string') return null;
@@ -100,13 +113,30 @@ function extractPrice(html) {
   // 1) JSON-LD structured data — the reliable path
   const ldRe = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
   let m;
+  const products = [];
   while ((m = ldRe.exec(html)) !== null) {
     let data;
     try { data = JSON.parse(m[1].trim()); } catch (e) { continue; }
-    const price = priceFromJsonLdObject(data, 0);
-    if (price != null) {
-      return { price, currency: guessCurrency(html, data), source: 'json-ld' };
+    collectProductOffers(data, 0, products);
+  }
+  const withPrices = products.filter(p => p.prices.length > 0);
+  if (withPrices.length > 0) {
+    if (withPrices.length > 1) {
+      // Same price repeated across blocks (common duplication) is one price.
+      // Several DISTINCT prices = several products = do not guess.
+      const distinct = new Set();
+      for (const p of withPrices) for (const v of p.prices) distinct.add(v.toFixed(2));
+      if (distinct.size > 1) return { ambiguous: true };
     }
+    // One product, possibly several seller offers: the lowest is the best
+    // price the user could actually pay.
+    const allPrices = withPrices.flatMap(p => p.prices);
+    return {
+      price: Math.min.apply(null, allPrices),
+      currency: firstNonNull(withPrices.map(p => p.currency)) || guessCurrency(html, null),
+      source: 'json-ld',
+      availability: firstNonNull(withPrices.map(p => p.availability)) || guessAvailability(html),
+    };
   }
 
   // 2) Meta tags
@@ -120,15 +150,37 @@ function extractPrice(html) {
     const mm = html.match(re);
     if (mm) {
       const p = normalizePrice(mm[1]);
-      if (p != null) return { price: p, currency: guessCurrency(html, null), source: 'meta' };
+      if (p != null) return { price: p, currency: guessCurrency(html, null), source: 'meta', availability: guessAvailability(html) };
     }
   }
 
-  // 3) Markup fallback — elements with price-ish class/id. Flagged unverified.
-  const markupRe = /<(?:span|div|p|strong|b)[^>]*(?:class|id)=["'][^"']*price[^"']*["'][^>]*>([^<]{1,40})<\//gi;
-  while ((m = markupRe.exec(html)) !== null) {
-    const p = normalizePrice(m[1]);
-    if (p != null) return { price: p, currency: guessCurrency(html, null), source: 'markup' };
+  // 3) Microdata — itemprop="price" on a real element (more reliable than
+  // class-name guessing because it is structured data, not presentation).
+  const microRes = [
+    /<[^>]+itemprop=["']price["'][^>]*content=["']([^"']+)["']/i,
+    /<[^>]+content=["']([^"']+)["'][^>]*itemprop=["']price["']/i,
+    /<[^>]+itemprop=["']price["'][^>]*>([^<]{1,40})</i,
+  ];
+  for (const re of microRes) {
+    const mm = html.match(re);
+    if (mm) {
+      const p = normalizePrice(mm[1]);
+      if (p != null) {
+        return { price: p, currency: guessMicrodataCurrency(html) || guessCurrency(html, null), source: 'microdata', availability: guessAvailability(html) };
+      }
+    }
+  }
+
+  // 4) Markup fallback — elements with price-ish class/id. Flagged unverified.
+  // Crossed-out prices are stripped first, and "was / RRP / original" elements
+  // are skipped, so a struck-through old price can never win.
+  const noStrike = html.replace(/<(del|s)[^>]*>[\s\S]*?<\/\1>/gi, '');
+  const markupRe = /<(?:span|div|p|strong|b)([^>]*?(?:class|id)=["'][^"']*price[^"']*["'][^>]*)>([^<]{1,40})<\//gi;
+  const wasRe = /old|was|strike|rrp|msrp|original|compare-at|list-price|retail|before|savings?/i;
+  while ((m = markupRe.exec(noStrike)) !== null) {
+    if (wasRe.test(m[1])) continue;
+    const p = normalizePrice(m[2]);
+    if (p != null) return { price: p, currency: guessCurrency(html, null), source: 'markup', availability: guessAvailability(html) };
   }
   return null;
 }
@@ -145,9 +197,108 @@ function guessCurrency(html, ldData) {
   return null;
 }
 
+function guessMicrodataCurrency(html) {
+  const m = html.match(/<[^>]+itemprop=["']priceCurrency["'][^>]*content=["']([^"']+)["']/i)
+    || html.match(/<[^>]+content=["']([^"']+)["'][^>]*itemprop=["']priceCurrency["']/i)
+    || html.match(/<[^>]+itemprop=["']priceCurrency["'][^>]*>([^<]{1,12})</i);
+  return m ? m[1].trim().toUpperCase() : null;
+}
+
+function guessAvailability(html) {
+  const m = html.match(/<meta[^>]+(?:property=["'](?:product:availability|og:availability)["']|itemprop=["']availability["'])[^>]*content=["']([^"']+)["']/i)
+    || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]*(?:property=["'](?:product:availability|og:availability)["']|itemprop=["']availability["'])/i);
+  if (m) return cleanAvailability(m[1]);
+  const ld = html.match(/"availability"\s*:\s*"([^"]+)"/i);
+  if (ld) return cleanAvailability(ld[1]);
+  return null;
+}
+
+/**
+ * Summary stats for a price history (array of numbers, oldest -> newest).
+ * Returns null for an empty history. Percentile / verdict need >= 5 points
+ * (below that, a "typical range" is noise, not signal).
+ * percentile = % of recorded prices at or above the current price, i.e. how
+ * much of the tracked history the current price beats.
+ */
+function priceStats(prices) {
+  if (!Array.isArray(prices) || prices.length === 0) return null;
+  const sorted = prices.slice().sort((a, b) => a - b);
+  const low = sorted[0];
+  const high = sorted[sorted.length - 1];
+  const avg = prices.reduce((s, v) => s + v, 0) / prices.length;
+  const current = prices[prices.length - 1];
+  const out = { low, high, avg, current, count: prices.length, p25: null, p75: null, percentile: null, verdict: null };
+  if (prices.length >= 5) {
+    const quantile = q => {
+      const pos = (sorted.length - 1) * q;
+      const base = Math.floor(pos);
+      const rest = pos - base;
+      if (sorted[base + 1] !== undefined) return sorted[base] + rest * (sorted[base + 1] - sorted[base]);
+      return sorted[base];
+    };
+    out.p25 = quantile(0.25);
+    out.p75 = quantile(0.75);
+    const atOrAbove = sorted.filter(v => v >= current).length;
+    out.percentile = Math.round((atOrAbove / sorted.length) * 100);
+    out.verdict = current <= out.p25 ? 'low' : (current >= out.p75 ? 'high' : 'typical');
+  }
+  return out;
+}
+
+/** Percentage drop from prev to curr (positive = price fell). Null if prev is not a usable baseline. */
+function dropPercent(prev, curr) {
+  if (!Number.isFinite(prev) || !Number.isFinite(curr) || prev <= 0) return null;
+  return ((prev - curr) / prev) * 100;
+}
+
+/**
+ * Validate + sanitize an imported watchlist payload.
+ * Returns an array of clean product objects, or null if the payload is not
+ * a SnipeWatch backup at all. Bad entries are dropped, never trusted.
+ */
+function sanitizeImportedProducts(data) {
+  if (!data || typeof data !== 'object' || !Array.isArray(data.products)) return null;
+  const out = [];
+  for (const raw of data.products) {
+    if (!raw || typeof raw !== 'object') continue;
+    if (typeof raw.name !== 'string' || !raw.name.trim()) continue;
+    if (typeof raw.url !== 'string') continue;
+    let url;
+    try {
+      const u = new URL(raw.url);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') continue;
+      url = u.href;
+    } catch (e) { continue; }
+    const target = Number(raw.target);
+    if (!Number.isFinite(target) || target <= 0) continue;
+    const history = [];
+    if (Array.isArray(raw.history)) {
+      for (const h of raw.history) {
+        const t = Number(h && h.t);
+        const price = Number(h && h.price);
+        if (Number.isFinite(t) && Number.isFinite(price) && price > 0) history.push({ t, price });
+      }
+    }
+    history.sort((a, b) => a.t - b.t);
+    const clean = {
+      name: raw.name.trim().slice(0, 80), url, target,
+      history: history.slice(-365),
+      lastCheck: Number.isFinite(Number(raw.lastCheck)) ? Number(raw.lastCheck) : null,
+      lastError: null, alerting: false, checking: false,
+      failCount: 0, lastBigDropPrice: null,
+      availability: typeof raw.availability === 'string' ? raw.availability : null,
+    };
+    if (clean.history.length && clean.history[clean.history.length - 1].price <= target) {
+      clean.alerting = true;
+    }
+    out.push(clean);
+  }
+  return out;
+}
+
 // Export for node tests; harmless in browsers.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { extractPrice, normalizePrice };
+  module.exports = { extractPrice, normalizePrice, priceStats, dropPercent, sanitizeImportedProducts };
 }
 
 /* ============================================================
@@ -190,6 +341,7 @@ if (typeof window !== 'undefined') (function () {
     add()    { this.tone(660, 0.12, 'sine'); },
     tick()   { this.tone(880, 0.06, 'square', 0, 0.06); },
     alert()  { this.tone(659.25, 0.16, 'triangle', 0, 0.22); this.tone(987.77, 0.24, 'triangle', 0.13, 0.22); },
+    bigDrop(){ this.tone(523.25, 0.14, 'triangle', 0, 0.2); this.tone(659.25, 0.14, 'triangle', 0.11, 0.2); this.tone(783.99, 0.22, 'triangle', 0.22, 0.22); },
     error()  { this.tone(180, 0.2, 'sawtooth', 0, 0.12); },
     remove() { this.tone(420, 0.1, 'sine'); this.tone(280, 0.14, 'sine', 0.08); },
   };
@@ -282,18 +434,24 @@ if (typeof window !== 'undefined') (function () {
       .then(html => {
         const found = extractPrice(html);
         p.checking = false;
-        if (!found) {
-          p.lastError = 'Could not read a price from this page (bot protection or layout change). Use "Log price" to enter it manually.';
+        if (!found || found.price == null) {
+          p.failCount = (p.failCount || 0) + 1;
+          if (found && found.ambiguous) {
+            p.lastError = 'This page lists several different products (category/search page?) — paste the single product page instead, or use "Log price".';
+          } else {
+            p.lastError = 'Could not read a price from this page (bot protection or layout change). Use "Log price" to enter it manually.';
+          }
           p.lastCheck = Date.now();
           saveState(); render();
           if (!opts.quiet) { Sfx.error(); toastSafe('No price found', 'for "' + p.name + '". Try logging it manually.', 'error'); }
           return;
         }
         p.lastError = null;
-        recordPrice(p, found.price, found.source);
+        recordPrice(p, found.price, found.source, found.availability);
       })
       .catch(err => {
         p.checking = false;
+        p.failCount = (p.failCount || 0) + 1;
         p.lastError = 'Check failed (' + (err && err.message ? err.message : 'network error') + '). Retry or log the price manually.';
         p.lastCheck = Date.now();
         saveState(); render();
@@ -301,14 +459,18 @@ if (typeof window !== 'undefined') (function () {
       });
   }
 
-  function recordPrice(p, price, source) {
+  function recordPrice(p, price, source, availability) {
     const now = Date.now();
     const last = p.history[p.history.length - 1];
-    if (!last || last.price !== price) {
+    const prevPrice = last ? last.price : null;
+    const isNewPoint = !last || last.price !== price;
+    if (isNewPoint) {
       p.history.push({ t: now, price });
       if (p.history.length > MAX_HISTORY) p.history = p.history.slice(-MAX_HISTORY);
     }
     p.lastCheck = now;
+    p.failCount = 0;
+    if (availability) p.availability = availability;
     const wasAlerting = p.alerting;
     p.alerting = price <= p.target;
     saveState(); render();
@@ -318,6 +480,20 @@ if (typeof window !== 'undefined') (function () {
       const msg = '"' + p.name + '" is now ' + fmtMoney(price) + ' (target ' + fmtMoney(p.target) + ')';
       toastSafe('🎯 Price drop!', msg);
       fireNotification('🎯 SnipeWatch price drop', msg);
+    } else if (isNewPoint && prevPrice != null) {
+      // Big drop that has NOT hit the target yet: still worth a celebration,
+      // it means the deal is moving. Debounced per price point so a repeated
+      // identical price never re-fires.
+      const drop = dropPercent(prevPrice, price);
+      if (drop != null && drop >= 10 && p.lastBigDropPrice !== price) {
+        p.lastBigDropPrice = price;
+        saveState();
+        Sfx.bigDrop();
+        celebrate(p);
+        toastSafe('📉 Big drop!', '"' + p.name + '" fell ' + drop.toFixed(1) + '% to ' + fmtMoney(price) + ' (target ' + fmtMoney(p.target) + ').');
+      } else {
+        Sfx.tick();
+      }
     } else {
       Sfx.tick();
     }
@@ -376,7 +552,8 @@ if (typeof window !== 'undefined') (function () {
     state.products.push({
       id: 'p' + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36),
       name, url, target, history: [], lastCheck: null, lastError: null,
-      alerting: false, checking: false,
+      alerting: false, checking: false, failCount: 0, lastBigDropPrice: null,
+      availability: null,
     });
     $('addForm').reset();
     saveState(); render(); Sfx.add();
@@ -433,6 +610,12 @@ if (typeof window !== 'undefined') (function () {
     del.addEventListener('click', () => deleteProduct(p.id));
     const rightWrap = document.createElement('div');
     rightWrap.style.display = 'flex'; rightWrap.style.alignItems = 'center'; rightWrap.style.gap = '4px';
+    if (p.availability === 'OutOfStock') {
+      const oos = document.createElement('span');
+      oos.className = 'oos-badge';
+      oos.textContent = 'Out of stock';
+      rightWrap.appendChild(oos);
+    }
     rightWrap.appendChild(badge); rightWrap.appendChild(del);
     top.appendChild(h3); top.appendChild(rightWrap);
     card.appendChild(top);
@@ -459,6 +642,22 @@ if (typeof window !== 'undefined') (function () {
     tline.textContent = 'Target: ' + fmtMoney(p.target);
     card.appendChild(tline);
 
+    // history stats: low / avg / high + percentile verdict once >= 5 points
+    if (p.history.length >= 2) {
+      const st = priceStats(p.history.map(h => h.price));
+      const sl = document.createElement('div');
+      sl.className = 'stats-line';
+      sl.appendChild(document.createTextNode('Low ' + fmtMoney(st.low) + ' · Avg ' + fmtMoney(st.avg) + ' · High ' + fmtMoney(st.high)));
+      if (st.percentile != null) {
+        const v = document.createElement('span');
+        v.className = st.verdict === 'low' ? 'verdict-low' : (st.verdict === 'high' ? 'verdict-high' : '');
+        v.textContent = ' · ' + (st.verdict === 'low' ? 'Currently low' : (st.verdict === 'high' ? 'Currently high' : 'Typical'))
+          + ' — cheaper than ' + st.percentile + '% of tracked prices';
+        sl.appendChild(v);
+      }
+      card.appendChild(sl);
+    }
+
     // chart
     const wrap = document.createElement('div');
     wrap.className = 'chart-wrap';
@@ -484,7 +683,10 @@ if (typeof window !== 'undefined') (function () {
 
     const status = document.createElement('div');
     status.className = 'status-line' + (p.lastError ? ' error' : (last ? ' ok' : ''));
-    if (p.lastError) status.textContent = '⚠ ' + p.lastError;
+    if (p.lastError) {
+      status.textContent = '⚠ ' + p.lastError
+        + ((p.failCount || 0) >= 3 ? ' (Failed ' + p.failCount + ' checks in a row — this site may block automated reads. "Log price" still works.)' : '');
+    }
     else if (last && p.lastCheck) status.textContent = '✓ Updated ' + new Date(p.lastCheck).toLocaleString() + ' · ' + p.history.length + ' data point' + (p.history.length === 1 ? '' : 's');
     else status.textContent = 'Not checked yet — hit "Check now" or log a price manually.';
     card.appendChild(status);
@@ -517,6 +719,20 @@ if (typeof window !== 'undefined') (function () {
     min -= spanPad; max += spanPad;
     const X = i => pad.l + (hist.length === 1 ? 0.5 : i / (hist.length - 1)) * (W - pad.l - pad.r);
     const Y = v => pad.t + (1 - (v - min) / (max - min)) * (H - pad.t - pad.b);
+
+    // typical-range band (p25–p75) + average line, once >= 5 points: shows
+    // at a glance whether the current price sits in the usual band or not.
+    if (hist.length >= 5) {
+      const st = priceStats(hist.map(h => h.price));
+      if (st && st.p25 != null) {
+        ctx.fillStyle = 'rgba(88,152,255,0.10)';
+        ctx.fillRect(pad.l, Y(st.p75), W - pad.l - pad.r, Y(st.p25) - Y(st.p75));
+        ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+        ctx.setLineDash([3, 4]); ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(pad.l, Y(st.avg)); ctx.lineTo(W - pad.r, Y(st.avg)); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
 
     // target line (dashed amber)
     ctx.strokeStyle = '#ffb020'; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.2;
@@ -565,6 +781,62 @@ if (typeof window !== 'undefined') (function () {
     };
     canvas.onmouseleave = () => { tip.style.display = 'none'; };
   }
+
+  /* ---------- export / import (backup & restore) ---------- */
+  $('exportBtn').addEventListener('click', () => {
+    const payload = {
+      app: 'snipewatch', version: 1, exportedAt: new Date().toISOString(),
+      products: state.products.map(p => Object.assign({}, p, { checking: false })),
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'snipewatch-backup-' + new Date().toISOString().slice(0, 10) + '.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    Sfx.tick();
+    toastSafe('Exported', state.products.length + ' tracked product(s) saved as JSON.', 'info');
+  });
+  $('importBtn').addEventListener('click', () => $('importFile').click());
+  $('importFile').addEventListener('change', e => {
+    const file = e.target.files && e.target.files[0];
+    $('importFile').value = '';
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      let data;
+      try { data = JSON.parse(reader.result); } catch (err) {
+        toastSafe('Import failed', 'That file is not valid JSON.', 'error');
+        return;
+      }
+      const incoming = sanitizeImportedProducts(data);
+      if (incoming == null) {
+        toastSafe('Import failed', 'That file is not a SnipeWatch backup (expected {"products": [...]}).', 'error');
+        return;
+      }
+      let added = 0, merged = 0;
+      for (const imp of incoming) {
+        const ex = state.products.find(x => x.url === imp.url);
+        if (!ex) {
+          imp.id = 'p' + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36);
+          state.products.push(imp);
+          added++;
+        } else {
+          // Merge histories by timestamp: keep the user's target/name, union the points.
+          const seen = new Set(ex.history.map(h => h.t));
+          for (const h of imp.history) {
+            if (!seen.has(h.t)) { ex.history.push(h); seen.add(h.t); }
+          }
+          ex.history.sort((a, b) => a.t - b.t);
+          if (ex.history.length > MAX_HISTORY) ex.history = ex.history.slice(-MAX_HISTORY);
+          merged++;
+        }
+      }
+      saveState(); render(); Sfx.add();
+      toastSafe('Import complete', added + ' new product(s), ' + merged + ' merged with existing.', 'info');
+    };
+    reader.readAsText(file);
+  });
 
   /* ---------- header controls ---------- */
   $('muteBtn').addEventListener('click', () => {
