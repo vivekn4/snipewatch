@@ -4,9 +4,12 @@
 **Never overpay again.** SnipeWatch tracks the products you want, watches their prices, and alerts you the moment one drops to (or below) your target price.
 
 - ✅ **100% client-side** — no backend, no accounts, no API keys. Your watchlist never leaves your device.
-- 💸 **Real price checks** — reads product pages through a free CORS proxy and parses the price from structured data (JSON-LD `offers` schema), with meta-tag and markup fallbacks.
-- 📉 **Price-history charts** — hand-drawn canvas charts per product with a dashed target-price line and hover tooltips. Zero chart libraries.
-- 🔔 **Drop alerts** — in-app toast + browser Notification API + a celebratory synthesized sound when a target is hit.
+- 💸 **Real price checks** — reads product pages through a free CORS proxy and parses the price from structured data (JSON-LD `offers` schema), with meta-tag, microdata (`itemprop="price"`), and markup fallbacks. A page with several *different* product prices (category/search page) is reported as **ambiguous** instead of guessing one — a wrong price is worse than no price.
+- 📉 **Price-history charts** — hand-drawn canvas charts per product with a dashed target-price line, a shaded p25–p75 typical-range band + average line (once ≥5 points), and hover tooltips. Zero chart libraries. Each card also shows Low / Avg / High plus a "cheaper than X% of tracked prices" verdict.
+- 🔔 **Drop alerts** — in-app toast + browser Notification API + a celebratory synthesized sound when a target is hit. A **≥10% drop that hasn't hit the target yet** gets its own "Big drop!" toast + fanfare, so you see momentum before the target lands.
+- 📦 **Export / Import** — back up the whole watchlist as JSON (Export) and restore it later (Import merges by URL, unions histories, never overwrites your targets).
+- 🏷️ **Stock status** — `availability` from structured data surfaces an **Out of stock** badge on the card.
+- 📛 **Failure tracking** — after 3 failed checks in a row, the card says the site may be blocking automated reads and points at **Log price**.
 - ⌨️ **Manual price logging** — for sites with bot protection (Amazon, etc.), log the price yourself and the history, charts, and alerts still work perfectly.
 - 🔊 **Synthesized SFX** — all sounds generated with WebAudio (zero audio files), with a persisted mute toggle.
 - 🆓 **Zero budget** — free forever. Deploy to GitHub Pages as static files.
@@ -21,11 +24,12 @@
 
 1. **Add a product** — paste the product page URL and set your target price.
 2. **Check prices** — hit *Check now* on a card or *Check all prices*. SnipeWatch fetches the page via `api.allorigins.win` (a free public CORS proxy) and looks for the price in this order:
-   1. JSON-LD structured data (`offers.price` / `lowPrice`) — what most retailers embed,
+   1. JSON-LD structured data (`offers.price` / `lowPrice`) — what most retailers embed. One product with several seller offers → the **lowest** offer (the best price you could pay). Several *different* products with different prices → **ambiguous**, no guess made.
    2. `<meta>` price tags (`og:price:amount`, `product:price:amount`, `itemprop="price"`),
-   3. page markup with price-like classes (flagged **unverified** in the UI),
-   4. **manual entry** — always available, works on every site.
-3. **Get alerted** — when the latest price is at or below your target, the card pulses green, a toast slides in, a browser notification fires (if enabled), and the coin-drop SFX plays.
+   3. microdata (`itemprop="price"` on page elements),
+   4. page markup with price-like classes — crossed-out (`<del>`/`<s>`) and "was / RRP / original" elements are skipped, and the value is flagged **unverified** in the UI,
+   5. **manual entry** — always available, works on every site.
+3. **Get alerted** — when the latest price is at or below your target, the card pulses green, a toast slides in, a browser notification fires (if enabled), and the coin-drop SFX plays. A ≥10% drop that hasn't reached the target yet fires a separate "Big drop!" toast + fanfare (once per price point).
 4. **Auto-check** — optionally re-check every 30 min / hour / 6 hours / day **while the tab is open**. (Static pages can't run in the background — this is stated in the UI, not hidden.)
 
 ## Honest compatibility notes
@@ -60,7 +64,7 @@ The price parser is pure JS with zero DOM dependencies, so it's unit-tested in N
 node test/parse_test.js
 ```
 
-4 HTML fixtures cover: JSON-LD single offer, JSON-LD `@graph` with European-format `lowPrice`, meta-tag fallback, and a bot-wall page (expects `null`). Plus 6 `normalizePrice` locale-format cases. `node --check` validates syntax.
+9 HTML fixtures cover: JSON-LD single offer, JSON-LD `@graph` with European-format `lowPrice`, meta-tag fallback, a bot-wall page (expects `null`), one product with two seller offers (expects the lowest), two distinct products (expects `{ambiguous: true}`), microdata `itemprop` fallback, markup with a crossed-out old price (expects the current price), and an out-of-stock JSON-LD offer. Plus 6 `normalizePrice` locale-format cases, `priceStats` (low/high/avg, p25/p75, percentile, verdict), `dropPercent`, and `sanitizeImportedProducts` (valid/invalid entries, non-backup shape) cases. `node --check` validates syntax.
 
 ## Project structure
 
